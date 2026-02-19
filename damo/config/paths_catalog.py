@@ -19,7 +19,25 @@ class DatasetCatalog(object):
             'img_dir': 'coco/test2017',
             'ann_file': 'coco/annotations/image_info_test-dev2017.json'
         },
-        }
+        # aliases used in da-damoyolo
+        'coco_train': {
+            'img_dir': 'coco/train/images',
+            'ann_file': 'coco/train/annotations/train.json'
+        },
+        'coco_val': {
+            'img_dir': 'coco/val/images',
+            'ann_file': 'coco/val/annotations/val.json'
+        },
+        'coco_test': {
+            'img_dir': 'coco/test/images',
+            'ann_file': 'coco/test/annotations/test.json'
+        },
+        # 50-image calibration subset prepared in this workspace
+        'coco_dropper_wire_calib50': {
+            'img_dir': '/home/td/jszp-dev/damoyolo_quant/artifacts/data/dropper_wire_calib50_coco/images',
+            'ann_file': '/home/td/jszp-dev/damoyolo_quant/artifacts/data/dropper_wire_calib50_coco/annotations/instances_dropper_wire_calib50.json'
+        },
+    }
 
     @staticmethod
     def get(name):
