@@ -28,6 +28,14 @@ python tools/partial_quantization/partial_quant.py -f configs/damoyolo_tinynasL2
 python tools/partial_quantization/partial_quant.py -f configs/damoyolo_tinynasL35_M.py -c damoyolo_tinynasL35_M.pth --batch_size 1 --img_size 640 --trt --trt_eval --model_type medium
 ```
 
+Notes:
+- `partial_quant.py` expects a DAMO PyTorch checkpoint (`.pth`) and config (`-f`). It does not quantize an existing ONNX file directly.
+- Rectangular export is supported via `--img_size HxW` or `--img_h ... --img_w ...`. Example:
+
+```python
+python tools/partial_quantization/partial_quant.py -f configs/damoyolo_tinynasL25_S.py -c damoyolo_tinynasL25_S.pth --batch_size 1 --img_size 1080x1920 --model_type small --dynamic_batch
+```
+
 ## Latency Measurement
 
 TRT model latency can be measured by trtexec.
