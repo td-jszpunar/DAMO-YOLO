@@ -9,8 +9,7 @@ class Config(MyConfig):
     def __init__(self):
         super(Config, self).__init__()
 
-        self.miscs.exp_name = os.path.split(
-            os.path.realpath(__file__))[1].split('.')[0]
+        self.miscs.exp_name = os.path.split(os.path.realpath(__file__))[1].split(".")[0]
         self.miscs.eval_interval_epochs = 10
         self.miscs.ckpt_interval_epochs = 10
         # optimizer
@@ -31,54 +30,71 @@ class Config(MyConfig):
         self.train.augment.mosaic_mixup.mosaic_scale = (0.1, 2.0)
 
         # dataset aliases compatible with da-damoyolo
-        self.dataset.train_ann = ('coco_train', )
-        self.dataset.val_ann = ('coco_val', )
+        self.dataset.train_ann = ("coco_train",)
+        self.dataset.val_ann = ("coco_dropper_wire_calib50",)
 
         # backbone
         structure = self.read_structure(
-            './damo/base_models/backbones/nas_backbones/tinynas_L25_k1kx.txt')
+            "./damo/base_models/backbones/nas_backbones/tinynas_L25_k1kx.txt"
+        )
         TinyNAS = {
-            'name': 'TinyNAS_res',
-            'net_structure_str': structure,
-            'out_indices': (2, 4, 5),
-            'with_spp': True,
-            'use_focus': True,
-            'act': 'relu',
-            'reparam': True,
+            "name": "TinyNAS_res",
+            "net_structure_str": structure,
+            "out_indices": (2, 4, 5),
+            "with_spp": True,
+            "use_focus": True,
+            "act": "relu",
+            "reparam": True,
         }
 
         self.model.backbone = TinyNAS
 
         GiraffeNeckV3 = {
-            'name': 'GiraffeNeckV3',
-            'depth': 1.0,
-            'hidden_ratio': 0.75,
-            'in_channels': [128, 256, 512],
-            'out_channels': [128, 256, 512],
-            'act': 'relu',
-            'spp': False,
-            'block_name': 'BasicBlock_3x3_Reverse',
+            "name": "GiraffeNeckV3",
+            "depth": 1.0,
+            "hidden_ratio": 0.75,
+            "in_channels": [128, 256, 512],
+            "out_channels": [128, 256, 512],
+            "act": "relu",
+            "spp": False,
+            "block_name": "BasicBlock_3x3_Reverse",
         }
 
         self.model.neck = GiraffeNeckV3
 
         # update this list to your training labels if they differ
         class_names = [
-            'panto_head', 'panto_knuckle', 'left_end', 'right_end',
-            'contact_point'
+            "broken_wire",
+            "mast",
+            "cantilever",
+            "reg_arm",
+            "util_pole",
+            "bird",
+            "insulator",
+            "dropper_wire_clip",
+            "portal_frame",
+            "pantograph_head",
+            "pantograph_knuckle",
+            "pantograph_left_end",
+            "pantograph_right_end",
+            "pantograph_left_carbon",
+            "pantograph_right_carbon",
+            "pantograph_left_carbon_tip",
+            "pantograph_right_carbon_tip",
+            "pantograph_contact_point",
         ]
 
         ZeroHead = {
-            'name': 'ZeroHead',
-            'num_classes': len(class_names),
-            'in_channels': [128, 256, 512],
-            'stacked_convs': 0,
-            'reg_max': 16,
-            'act': 'silu',
-            'nms_conf_thre': 0.05,
-            'nms_iou_thre': 0.7,
-            'legacy': False,
-            'strides': [8, 16, 32],
+            "name": "ZeroHead",
+            "num_classes": len(class_names),
+            "in_channels": [128, 256, 512],
+            "stacked_convs": 0,
+            "reg_max": 16,
+            "act": "silu",
+            "nms_conf_thre": 0.05,
+            "nms_iou_thre": 0.7,
+            "legacy": False,
+            "strides": [8, 16, 32],
         }
         self.model.head = ZeroHead
         self.dataset.class_names = class_names
