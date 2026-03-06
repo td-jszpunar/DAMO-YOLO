@@ -24,6 +24,7 @@ from tools.partial_quantization.utils import (
     init_calib_data_loader,
     destroy_calib_data_loader,
     torch_load_compat,
+    extract_state_dict,
 )
 
 from pytorch_quantization import nn as quant_nn
@@ -217,15 +218,44 @@ def make_parser():
         help="safety ratio for auto-capping calibration batches to avoid int32 overflow",
     )
     parser.add_argument(
+        "--calib_input_range",
+        type=str,
+        choices=["0_1", "0_255"],
+        default="0_1",
+        help="calibration input scaling: 0_1 divides calibration images by 255 to match deployment preprocessing",
+    )
+    parser.add_argument(
         "--no_calib_auto_cap",
         action="store_true",
         help="disable auto-capping calibration batches based on inferred tensor size",
+    )
+    parser.add_argument(
+        "--no_quant",
+        action="store_true",
+        help="skip PTQ entirely and export a float ONNX through this script",
     )
     parser.add_argument(
         "--model_type",
         type=str,
         default=None,
         help="quant model type(tiny, small, medium)",
+    )
+    parser.add_argument(
+        "--keep_head_fp",
+        action="store_true",
+        help="keep the final detection head convolutions in full precision",
+    )
+    parser.add_argument(
+        "--quant_op_indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help="explicit quantizable op indices to quantize; overrides --model_type presets",
+    )
+    parser.add_argument(
+        "--list_quant_ops",
+        action="store_true",
+        help="print quantizable op indices/names and exit",
     )
     parser.add_argument(
         "--sensitivity_file", type=str, default=None, help="sensitivity file"
@@ -319,7 +349,8 @@ def main():
     if args.calib_batches <= 0:
         raise ValueError("--calib_batches must be > 0.")
 
-    onnx_name = args.config_file.split("/")[-1].replace(".py", "_partial_quant.onnx")
+    onnx_suffix = "_no_quant.onnx" if args.no_quant else "_partial_quant.onnx"
+    onnx_name = args.config_file.split("/")[-1].replace(".py", onnx_suffix)
     raw_onnx_name = onnx_name.replace(".onnx", "_raw.onnx")
     # Check device
     cuda = args.device != "cpu" and torch.cuda.is_available()
@@ -335,15 +366,40 @@ def main():
 
     # Ensure calibration dataloader uses a fixed export resolution (supports rectangular inputs).
     config.test.augment.transform.target_size = (inference_h, inference_w)
+    if args.calib_input_range == "0_1":
+        config.test.augment.transform.image_mean = [0.0, 0.0, 0.0]
+        config.test.augment.transform.image_std = [255.0, 255.0, 255.0]
+    else:
+        config.test.augment.transform.image_mean = [0.0, 0.0, 0.0]
+        config.test.augment.transform.image_std = [1.0, 1.0, 1.0]
+    logger.info(
+        "Calibration preprocessing: target_size={}x{}, image_mean={}, image_std={}".format(
+            inference_h,
+            inference_w,
+            config.test.augment.transform.image_mean,
+            config.test.augment.transform.image_std,
+        )
+    )
 
     # build model
     model = build_local_model(config, device)
     ckpt = torch_load_compat(args.ckpt, map_location="cpu")
     model.eval()
-    if "model" in ckpt:
-        ckpt = ckpt["model"]
-    model.load_state_dict(ckpt, strict=False)
-    logger.info("loading checkpoint done.")
+    state_dict = extract_state_dict(ckpt)
+    load_result = model.load_state_dict(state_dict, strict=False)
+    logger.info(
+        "loading checkpoint done. missing_keys={}, unexpected_keys={}".format(
+            len(load_result.missing_keys), len(load_result.unexpected_keys)
+        )
+    )
+    if load_result.missing_keys:
+        logger.warning(
+            "Missing checkpoint keys: {}".format(load_result.missing_keys[:20])
+        )
+    if load_result.unexpected_keys:
+        logger.warning(
+            "Unexpected checkpoint keys: {}".format(load_result.unexpected_keys[:20])
+        )
     model = replace_module(model, nn.SiLU, SiLU)
     for layer in model.modules():
         if isinstance(layer, RepConv):
@@ -354,138 +410,186 @@ def main():
     # decouple postprocess
     model.head.nms = False
 
-    # 1. do post training quantization
-    if args.calib_weights is None:
-        calib_data_loader = init_calib_data_loader(config)
-        try:
+    if args.no_quant:
+        logger.warning(
+            "Skipping PTQ and exporting float model through partial_quant.py."
+        )
+        ptq_model = model
+    else:
+        # 1. do post training quantization
+        if args.calib_weights is None:
+            calib_data_loader = init_calib_data_loader(config)
             try:
-                loader_batches = len(calib_data_loader)
-            except TypeError:
-                loader_batches = None
+                try:
+                    loader_batches = len(calib_data_loader)
+                except TypeError:
+                    loader_batches = None
 
-            requested_calib_batches = args.calib_batches
-            max_elements_per_sample = None
-            max_module_name = None
-            safe_calib_batches = None
-            effective_calib_batches = requested_calib_batches
+                requested_calib_batches = args.calib_batches
+                max_elements_per_sample = None
+                max_module_name = None
+                safe_calib_batches = None
+                effective_calib_batches = requested_calib_batches
 
-            if args.no_calib_auto_cap:
-                if loader_batches is not None:
-                    effective_calib_batches = min(
-                        requested_calib_batches, loader_batches
-                    )
-                logger.info(
-                    "Calibration auto-cap disabled. requested_batches={}, loader_batches={}, effective_batches={}".format(
-                        requested_calib_batches,
-                        loader_batches if loader_batches is not None else "unknown",
-                        effective_calib_batches,
-                    )
-                )
-            else:
-                max_elements_per_sample, max_module_name = probe_max_quant_input_elements(
-                    model, inference_h, inference_w, device
-                )
-                safe_calib_batches = compute_safe_calib_batches(
-                    max_elements_per_sample=max_elements_per_sample,
-                    batch_size=args.batch_size,
-                    safety_ratio=args.calib_safety_ratio,
-                )
-
-                batch_limits = [requested_calib_batches, safe_calib_batches]
-                if loader_batches is not None:
-                    batch_limits.append(loader_batches)
-                effective_calib_batches = min(batch_limits)
-
-                logger.info(
-                    "Calibration batch planning: requested_batches={}, loader_batches={}, safe_batches={}, "
-                    "effective_batches={}, max_elements_per_sample={}, max_module='{}'".format(
-                        requested_calib_batches,
-                        loader_batches if loader_batches is not None else "unknown",
-                        safe_calib_batches,
-                        effective_calib_batches,
-                        max_elements_per_sample,
-                        max_module_name,
-                    )
-                )
-                if effective_calib_batches < requested_calib_batches:
-                    logger.warning(
-                        "Calibration batches capped from {} to {}.".format(
-                            requested_calib_batches, effective_calib_batches
+                if args.no_calib_auto_cap:
+                    if loader_batches is not None:
+                        effective_calib_batches = min(
+                            requested_calib_batches, loader_batches
+                        )
+                    logger.info(
+                        "Calibration auto-cap disabled. requested_batches={}, loader_batches={}, effective_batches={}".format(
+                            requested_calib_batches,
+                            loader_batches if loader_batches is not None else "unknown",
+                            effective_calib_batches,
                         )
                     )
+                else:
+                    max_elements_per_sample, max_module_name = (
+                        probe_max_quant_input_elements(
+                            model, inference_h, inference_w, device
+                        )
+                    )
+                    safe_calib_batches = compute_safe_calib_batches(
+                        max_elements_per_sample=max_elements_per_sample,
+                        batch_size=args.batch_size,
+                        safety_ratio=args.calib_safety_ratio,
+                    )
 
-            ptq_model = post_train_quant(
-                model,
-                calib_data_loader,
-                effective_calib_batches,
-                device,
-                calib_method=args.calib_method,
-                fallback_method=args.calib_fallback_method,
-                percentile=args.calib_percentile,
+                    batch_limits = [requested_calib_batches, safe_calib_batches]
+                    if loader_batches is not None:
+                        batch_limits.append(loader_batches)
+                    effective_calib_batches = min(batch_limits)
+
+                    logger.info(
+                        "Calibration batch planning: requested_batches={}, loader_batches={}, safe_batches={}, "
+                        "effective_batches={}, max_elements_per_sample={}, max_module='{}'".format(
+                            requested_calib_batches,
+                            loader_batches if loader_batches is not None else "unknown",
+                            safe_calib_batches,
+                            effective_calib_batches,
+                            max_elements_per_sample,
+                            max_module_name,
+                        )
+                    )
+                    if effective_calib_batches < requested_calib_batches:
+                        logger.warning(
+                            "Calibration batches capped from {} to {}.".format(
+                                requested_calib_batches, effective_calib_batches
+                            )
+                        )
+
+                ptq_model = post_train_quant(
+                    model,
+                    calib_data_loader,
+                    effective_calib_batches,
+                    device,
+                    calib_method=args.calib_method,
+                    fallback_method=args.calib_fallback_method,
+                    percentile=args.calib_percentile,
+                )
+                torch.save(
+                    {"model_state_dict": ptq_model.state_dict()},
+                    args.ckpt.replace(".pth", "_calib.pth"),
+                )
+            finally:
+                destroy_calib_data_loader()
+        else:
+            ptq_model = load_quanted_model(
+                model, args.calib_weights, device, calib_method=args.calib_method
             )
-            torch.save(
-                {"model_state_dict": ptq_model.state_dict()},
-                args.ckpt.replace(".pth", "_calib.pth"),
+
+        # 2. load sensitivity data
+        all_ops = list()
+        for k, m in ptq_model.named_modules():
+            if (
+                isinstance(m, quant_nn.QuantConv2d)
+                or isinstance(m, quant_nn.QuantConvTranspose2d)
+                or isinstance(m, quant_nn.MaxPool2d)
+            ):
+                all_ops.append((k))
+
+        if args.list_quant_ops:
+            for idx, op_name in enumerate(all_ops):
+                logger.info(
+                    "quant_op[{idx:02d}] = {name}".format(idx=idx, name=op_name)
+                )
+            return
+
+        if args.quant_op_indices is not None:
+            selected_inds = sorted(set(args.quant_op_indices))
+            invalid_inds = [
+                idx for idx in selected_inds if idx < 0 or idx >= len(all_ops)
+            ]
+            if invalid_inds:
+                raise ValueError(
+                    "Invalid --quant_op_indices {}. Valid range is [0, {}].".format(
+                        invalid_inds, len(all_ops) - 1
+                    )
+                )
+            if args.keep_head_fp:
+                logger.warning(
+                    "--keep_head_fp is ignored because --quant_op_indices explicitly selects ops."
+                )
+            ops_to_quant = [all_ops[idx] for idx in selected_inds]
+            logger.info(
+                "Using explicit quant op indices: {}".format(
+                    ", ".join(str(idx) for idx in selected_inds)
+                )
             )
-        finally:
-            destroy_calib_data_loader()
-    else:
-        ptq_model = load_quanted_model(
-            model, args.calib_weights, device, calib_method=args.calib_method
+        else:
+            quant_model = args.model_type
+            if quant_model == "tiny":
+                backbone_inds = list(range(24))
+                neck_inds = []
+                head_inds = list(range(74, 80))
+            elif quant_model == "small":
+                backbone_inds = list(range(30))
+                neck_inds = (
+                    list(range(30, 31))
+                    + list(range(32, 40))
+                    + list(range(40, 41))
+                    + list(range(42, 49))
+                    + list(range(50, 51))
+                    + list(range(52, 59))
+                    + list(range(60, 61))
+                    + list(range(62, 69))
+                    + list(range(70, 71))
+                    + list(range(72, 79))
+                )
+                head_inds = list(range(80, 86))
+            elif quant_model == "medium":
+                backbone_inds = (
+                    list(range(5))
+                    + list(range(6, 15))
+                    + list(range(16, 33))
+                    + list(range(34, 46))
+                    + list(range(47, 48))
+                )
+                neck_inds = []
+                head_inds = list(range(108, 114))
+            else:
+                raise ValueError(
+                    "Provide either --no_quant, --quant_op_indices, or a supported --model_type (tiny, small, medium)."
+                )
+
+            all_inds = backbone_inds + neck_inds + head_inds
+            if args.keep_head_fp:
+                logger.warning(
+                    "Keeping detection head in FP; excluding head ops from quantization."
+                )
+                all_inds = backbone_inds + neck_inds
+
+            ops_to_quant = [all_ops[x] for x in all_inds]
+        logger.info(
+            "Partial quantization will quantize {} / {} candidate ops.".format(
+                len(ops_to_quant), len(all_ops)
+            )
         )
+        for op_name in ops_to_quant:
+            logger.info("quantizing op: {}".format(op_name))
 
-    # 2. load sensitivity data
-    all_ops = list()
-    for k, m in ptq_model.named_modules():
-        if (
-            isinstance(m, quant_nn.QuantConv2d)
-            or isinstance(m, quant_nn.QuantConvTranspose2d)
-            or isinstance(m, quant_nn.MaxPool2d)
-        ):
-            all_ops.append((k))
-
-    quant_model = args.model_type
-    if quant_model == "tiny":
-        backbone_inds = list(range(24))
-        neck_inds = []
-        head_inds = list(range(74, 80))
-    elif quant_model == "small":
-        backbone_inds = list(range(30))
-        neck_inds = (
-            list(range(30, 31))
-            + list(range(32, 40))
-            + list(range(40, 41))
-            + list(range(42, 49))
-            + list(range(50, 51))
-            + list(range(52, 59))
-            + list(range(60, 61))
-            + list(range(62, 69))
-            + list(range(70, 71))
-            + list(range(72, 79))
-        )
-        head_inds = list(range(80, 86))
-    elif quant_model == "medium":
-        backbone_inds = (
-            list(range(5))
-            + list(range(6, 15))
-            + list(range(16, 33))
-            + list(range(34, 46))
-            + list(range(47, 48))
-        )
-        neck_inds = []
-        head_inds = list(range(108, 114))
-    else:
-        raise ValueError(
-            "unsupported model type in requested schema(tiny, small, medium)"
-        )
-
-    all_inds = backbone_inds + neck_inds + head_inds
-
-    quantable_sensitivity = [all_ops[x] for x in all_inds]
-    ops_to_quant = [qops for qops in quantable_sensitivity]
-
-    # 3. only quantize ops in quantable_ops list
-    execute_partial_quant(ptq_model, ops_to_quant=ops_to_quant)
+        # 3. only quantize ops in quantable_ops list
+        execute_partial_quant(ptq_model, ops_to_quant=ops_to_quant)
 
     # 4. ONNX export
     quant_nn.TensorQuantizer.use_fb_fake_quant = True

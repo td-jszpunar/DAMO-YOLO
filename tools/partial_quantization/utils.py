@@ -19,6 +19,24 @@ def torch_load_compat(path, map_location="cpu"):
         return torch.load(path, map_location=map_location)
 
 
+def extract_state_dict(ckpt):
+    """Normalize common checkpoint layouts to a raw state_dict."""
+    if isinstance(ckpt, dict):
+        if "model_state_dict" in ckpt:
+            return ckpt["model_state_dict"]
+        if "state_dict" in ckpt:
+            return ckpt["state_dict"]
+        if "model" in ckpt:
+            model_obj = ckpt["model"]
+            return (
+                model_obj.state_dict()
+                if hasattr(model_obj, "state_dict")
+                else model_obj
+            )
+        return ckpt
+    return ckpt.state_dict()
+
+
 def set_module(model, submodule_key, module):
     tokens = submodule_key.split(".")
     sub_tokens = tokens[:-1]
@@ -228,15 +246,7 @@ def post_train_quant(
 def load_quanted_model(model, calib_weights_path, device, calib_method="entropy"):
     ptq_model = quant_model_init(model, device, calib_method=calib_method)
     ckpt = torch_load_compat(calib_weights_path, map_location="cpu")
-    if isinstance(ckpt, dict):
-        if "model_state_dict" in ckpt:
-            state_dict = ckpt["model_state_dict"]
-        elif "model" in ckpt:
-            state_dict = ckpt["model"].state_dict()
-        else:
-            state_dict = ckpt
-    else:
-        state_dict = ckpt.state_dict()
+    state_dict = extract_state_dict(ckpt)
     ptq_model.load_state_dict(state_dict)
     return ptq_model
 
