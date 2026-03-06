@@ -38,6 +38,16 @@ class DatasetCatalog(object):
             "img_dir": "/home/jakub/damoyolo_quant/validation_data/dropper_wire_calib50_coco/images",
             "ann_file": "/home/jakub/damoyolo_quant/validation_data/dropper_wire_calib50_coco/annotations/instances_dropper_wire_calib50.json",
         },
+        # 1000-image calibration subset prepared in this workspace
+        "coco_dropper_wire_calib1000": {
+            "img_dir": "/home/jakub/damoyolo_quant/validation_data/dropper_wire_calib1000_coco/images",
+            "ann_file": "/home/jakub/damoyolo_quant/validation_data/dropper_wire_calib1000_coco/annotations/instances_dropper_wire_calib1000.json",
+        },        
+        # 500-image calibration subset prepared in this workspace
+        "coco_dropper_wire_calib500": {
+            "img_dir": "/home/jakub/damoyolo_quant/validation_data/dropper_wire_calib500_coco/images",
+            "ann_file": "/home/jakub/damoyolo_quant/validation_data/dropper_wire_calib500_coco/annotations/instances_dropper_wire_calib500.json",
+        },
     }
 
     @staticmethod

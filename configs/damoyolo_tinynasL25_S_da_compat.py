@@ -31,7 +31,7 @@ class Config(MyConfig):
 
         # dataset aliases compatible with da-damoyolo
         self.dataset.train_ann = ("coco_train",)
-        self.dataset.val_ann = ("coco_dropper_wire_calib50",)
+        self.dataset.val_ann = ("coco_dropper_wire_calib500",)
 
         # backbone
         structure = self.read_structure(

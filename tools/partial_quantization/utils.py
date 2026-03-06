@@ -76,7 +76,25 @@ def collect_stats(model, data_loader, batch_number, device="cuda"):
                 module.enable()
 
 
-def compute_amax(model, **kwargs):
+def _load_module_calib_amax(module, method="entropy", percentile=99.99):
+    if isinstance(module._calibrator, calib.MaxCalibrator):
+        module.load_calib_amax()
+        return
+
+    if method == "entropy":
+        module.load_calib_amax(method="entropy")
+    elif method == "percentile":
+        module.load_calib_amax(method="percentile", percentile=percentile)
+    elif method == "max":
+        # Histogram calibrator has no direct "max" method, so use full percentile.
+        module.load_calib_amax(method="percentile", percentile=100.0)
+    else:
+        raise ValueError(f"Unknown calibration method: {method}")
+
+
+def compute_amax(
+    model, method="entropy", fallback_method="percentile", percentile=99.99
+):
     """
     code mainly from https://github.com/NVIDIA/TensorRT/blob/99a11a5fcdd1f184739bb20a8c4a473262c8ecc8/tools/pytorch-quantization/examples/torchvision/classification_flow.py
     Load calib result
@@ -85,10 +103,27 @@ def compute_amax(model, **kwargs):
         if isinstance(module, quant_nn.TensorQuantizer):
             print(f"{name:40}: {module}")
             if module._calibrator is not None:
-                if isinstance(module._calibrator, calib.MaxCalibrator):
-                    module.load_calib_amax()
-                else:
-                    module.load_calib_amax(**kwargs)
+                try:
+                    _load_module_calib_amax(
+                        module, method=method, percentile=percentile
+                    )
+                except (OverflowError, RuntimeError) as primary_exc:
+                    can_fallback = (
+                        fallback_method is not None
+                        and fallback_method != "none"
+                        and fallback_method != method
+                    )
+                    if not can_fallback:
+                        raise
+                    print(
+                        "Primary calibration failed on {} with method '{}': {}. "
+                        "Retrying with fallback '{}'.".format(
+                            name, method, primary_exc, fallback_method
+                        )
+                    )
+                    _load_module_calib_amax(
+                        module, method=fallback_method, percentile=percentile
+                    )
 
 
 def quantable_op_check(k, ops_to_quant):
@@ -101,17 +136,20 @@ def quantable_op_check(k, ops_to_quant):
         return False
 
 
-def quant_model_init(ori_model, device):
+def quant_model_init(ori_model, device, calib_method="entropy"):
     ptq_model = copy.deepcopy(ori_model)
     ptq_model.eval()
     ptq_model.to(device)
+    calib_desc_method = "max" if calib_method == "max" else "histogram"
     quant_conv_desc_weight = tensor_quant.QUANT_DESC_8BIT_CONV2D_WEIGHT_PER_CHANNEL
-    quant_conv_desc_input = QuantDescriptor(num_bits=8, calib_method="histogram")
+    quant_conv_desc_input = QuantDescriptor(num_bits=8, calib_method=calib_desc_method)
 
     quant_convtrans_desc_weight = (
         tensor_quant.QUANT_DESC_8BIT_CONVTRANSPOSE2D_WEIGHT_PER_CHANNEL
     )
-    quant_convtrans_desc_input = QuantDescriptor(num_bits=8, calib_method="histogram")
+    quant_convtrans_desc_input = QuantDescriptor(
+        num_bits=8, calib_method=calib_desc_method
+    )
 
     for k, m in ptq_model.named_modules():
         if "proj_conv" in k:
@@ -166,16 +204,29 @@ def quant_model_init(ori_model, device):
     return ptq_model.to(device)
 
 
-def post_train_quant(ori_model, calib_data_loader, calib_img_number, device):
-    ptq_model = quant_model_init(ori_model, device)
+def post_train_quant(
+    ori_model,
+    calib_data_loader,
+    calib_img_number,
+    device,
+    calib_method="entropy",
+    fallback_method="percentile",
+    percentile=99.99,
+):
+    ptq_model = quant_model_init(ori_model, device, calib_method=calib_method)
     with torch.no_grad():
         collect_stats(ptq_model, calib_data_loader, calib_img_number, device)
-        compute_amax(ptq_model, method="entropy")
+        compute_amax(
+            ptq_model,
+            method=calib_method,
+            fallback_method=fallback_method,
+            percentile=percentile,
+        )
     return ptq_model
 
 
-def load_quanted_model(model, calib_weights_path, device):
-    ptq_model = quant_model_init(model, device)
+def load_quanted_model(model, calib_weights_path, device, calib_method="entropy"):
+    ptq_model = quant_model_init(model, device, calib_method=calib_method)
     ckpt = torch_load_compat(calib_weights_path, map_location="cpu")
     if isinstance(ckpt, dict):
         if "model_state_dict" in ckpt:
@@ -205,10 +256,17 @@ def execute_partial_quant(ptq_model, ops_to_quant=None):
 
 def init_calib_data_loader(config):
     # init dataloader
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "5678"
-    os.environ["WORLD_SIZE"] = "1"
-    torch.distributed.init_process_group(backend="nccl", init_method="env://", rank=0)
+    if torch.distributed.is_available() and not torch.distributed.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if backend == "gloo":
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+        init_file = os.path.join("/tmp", f"damoyolo_ptq_dist_{os.getpid()}")
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method=f"file://{init_file}",
+            rank=0,
+            world_size=1,
+        )
 
     val_dataset = build_dataset(config, config.dataset.val_ann, is_train=False)
     val_loader = build_dataloader(
@@ -221,3 +279,8 @@ def init_calib_data_loader(config):
     )
 
     return val_loader[0]
+
+
+def destroy_calib_data_loader():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()

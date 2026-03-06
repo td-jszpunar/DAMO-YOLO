@@ -22,6 +22,7 @@ from tools.partial_quantization.utils import (
     load_quanted_model,
     execute_partial_quant,
     init_calib_data_loader,
+    destroy_calib_data_loader,
     torch_load_compat,
 )
 
@@ -65,6 +66,60 @@ def parse_inference_size(args):
             f"Inference size must be positive, got ({inference_h}, {inference_w})."
         )
     return inference_h, inference_w
+
+
+def probe_max_quant_input_elements(model, inference_h, inference_w, device):
+    """Find max per-sample input elements among quantizable ops at export size."""
+
+    max_elements = 0
+    max_module = "N/A"
+    hooks = []
+    candidate_types = (nn.Conv2d, nn.ConvTranspose2d, nn.MaxPool2d)
+
+    def make_hook(name):
+        def _hook(_module, inputs):
+            nonlocal max_elements, max_module
+            if not inputs:
+                return
+            x = inputs[0]
+            if not torch.is_tensor(x) or x.numel() == 0:
+                return
+            if x.dim() > 0 and x.size(0) > 0:
+                per_sample_elements = x[0].numel()
+            else:
+                per_sample_elements = x.numel()
+            if per_sample_elements > max_elements:
+                max_elements = int(per_sample_elements)
+                max_module = name
+
+        return _hook
+
+    for name, module in model.named_modules():
+        if isinstance(module, candidate_types):
+            hooks.append(module.register_forward_pre_hook(make_hook(name)))
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, inference_h, inference_w, device=device)
+            _ = model(dummy_input)
+    finally:
+        for hook in hooks:
+            hook.remove()
+        if was_training:
+            model.train()
+
+    return max_elements, max_module
+
+
+def compute_safe_calib_batches(max_elements_per_sample, batch_size, safety_ratio):
+    int32_max = 2_147_483_647
+    denom = int(max_elements_per_sample) * int(batch_size)
+    if denom <= 0:
+        return 1
+    safe_batches = int((int32_max * safety_ratio) // denom)
+    return max(safe_batches, 1)
 
 
 def make_parser():
@@ -129,6 +184,43 @@ def make_parser():
         "-o", "--opset", default=11, type=int, help="onnx opset version"
     )
     parser.add_argument("--calib_weights", type=str, default=None, help="calib weights")
+    parser.add_argument(
+        "--calib_batches",
+        type=int,
+        default=1000,
+        help="maximum calibration batches to consume",
+    )
+    parser.add_argument(
+        "--calib_method",
+        type=str,
+        choices=["entropy", "percentile", "max"],
+        default="entropy",
+        help="primary calibration method",
+    )
+    parser.add_argument(
+        "--calib_fallback_method",
+        type=str,
+        choices=["percentile", "max", "none"],
+        default="percentile",
+        help="fallback method if primary amax calibration fails",
+    )
+    parser.add_argument(
+        "--calib_percentile",
+        type=float,
+        default=99.99,
+        help="percentile value used by percentile calibration",
+    )
+    parser.add_argument(
+        "--calib_safety_ratio",
+        type=float,
+        default=0.9,
+        help="safety ratio for auto-capping calibration batches to avoid int32 overflow",
+    )
+    parser.add_argument(
+        "--no_calib_auto_cap",
+        action="store_true",
+        help="disable auto-capping calibration batches based on inferred tensor size",
+    )
     parser.add_argument(
         "--model_type",
         type=str,
@@ -222,8 +314,13 @@ def main():
     logger.info("args value: {}".format(args))
     inference_h, inference_w = parse_inference_size(args)
     logger.info(f"Using inference size: {inference_h}x{inference_w}")
+    if not (0 < args.calib_safety_ratio <= 1):
+        raise ValueError("--calib_safety_ratio must be in (0, 1].")
+    if args.calib_batches <= 0:
+        raise ValueError("--calib_batches must be > 0.")
 
     onnx_name = args.config_file.split("/")[-1].replace(".py", "_partial_quant.onnx")
+    raw_onnx_name = onnx_name.replace(".onnx", "_raw.onnx")
     # Check device
     cuda = args.device != "cpu" and torch.cuda.is_available()
     device = torch.device(f"cuda:{args.device}" if cuda else "cpu")
@@ -260,13 +357,82 @@ def main():
     # 1. do post training quantization
     if args.calib_weights is None:
         calib_data_loader = init_calib_data_loader(config)
-        ptq_model = post_train_quant(model, calib_data_loader, 1000, device)
-        torch.save(
-            {"model_state_dict": ptq_model.state_dict()},
-            args.ckpt.replace(".pth", "_calib.pth"),
-        )
+        try:
+            try:
+                loader_batches = len(calib_data_loader)
+            except TypeError:
+                loader_batches = None
+
+            requested_calib_batches = args.calib_batches
+            max_elements_per_sample = None
+            max_module_name = None
+            safe_calib_batches = None
+            effective_calib_batches = requested_calib_batches
+
+            if args.no_calib_auto_cap:
+                if loader_batches is not None:
+                    effective_calib_batches = min(
+                        requested_calib_batches, loader_batches
+                    )
+                logger.info(
+                    "Calibration auto-cap disabled. requested_batches={}, loader_batches={}, effective_batches={}".format(
+                        requested_calib_batches,
+                        loader_batches if loader_batches is not None else "unknown",
+                        effective_calib_batches,
+                    )
+                )
+            else:
+                max_elements_per_sample, max_module_name = probe_max_quant_input_elements(
+                    model, inference_h, inference_w, device
+                )
+                safe_calib_batches = compute_safe_calib_batches(
+                    max_elements_per_sample=max_elements_per_sample,
+                    batch_size=args.batch_size,
+                    safety_ratio=args.calib_safety_ratio,
+                )
+
+                batch_limits = [requested_calib_batches, safe_calib_batches]
+                if loader_batches is not None:
+                    batch_limits.append(loader_batches)
+                effective_calib_batches = min(batch_limits)
+
+                logger.info(
+                    "Calibration batch planning: requested_batches={}, loader_batches={}, safe_batches={}, "
+                    "effective_batches={}, max_elements_per_sample={}, max_module='{}'".format(
+                        requested_calib_batches,
+                        loader_batches if loader_batches is not None else "unknown",
+                        safe_calib_batches,
+                        effective_calib_batches,
+                        max_elements_per_sample,
+                        max_module_name,
+                    )
+                )
+                if effective_calib_batches < requested_calib_batches:
+                    logger.warning(
+                        "Calibration batches capped from {} to {}.".format(
+                            requested_calib_batches, effective_calib_batches
+                        )
+                    )
+
+            ptq_model = post_train_quant(
+                model,
+                calib_data_loader,
+                effective_calib_batches,
+                device,
+                calib_method=args.calib_method,
+                fallback_method=args.calib_fallback_method,
+                percentile=args.calib_percentile,
+            )
+            torch.save(
+                {"model_state_dict": ptq_model.state_dict()},
+                args.ckpt.replace(".pth", "_calib.pth"),
+            )
+        finally:
+            destroy_calib_data_loader()
     else:
-        ptq_model = load_quanted_model(model, args.calib_weights, device)
+        ptq_model = load_quanted_model(
+            model, args.calib_weights, device, calib_method=args.calib_method
+        )
 
     # 2. load sensitivity data
     all_ops = list()
@@ -349,7 +515,7 @@ def main():
         legacy_onnx_export(
             ptq_model,
             dummy_input,
-            onnx_name,
+            raw_onnx_name,
             **export_kwargs,
         )
     else:
@@ -358,7 +524,7 @@ def main():
             onnx_export(
                 ptq_model,
                 dummy_input,
-                onnx_name,
+                raw_onnx_name,
                 **export_kwargs,
             )
         except TypeError:
@@ -366,10 +532,12 @@ def main():
             onnx_export(
                 ptq_model,
                 dummy_input,
-                onnx_name,
+                raw_onnx_name,
                 **export_kwargs,
             )
-    onnx_model = onnx.load(onnx_name)  # Fix output shape
+    logger.info("generated raw onnx model named {}".format(raw_onnx_name))
+
+    onnx_model = onnx.load(raw_onnx_name)  # Fix output shape
     try:
         import onnxsim
 
@@ -380,7 +548,7 @@ def main():
     except Exception as e:
         logger.info(f"simplify skipped: {e}")
     onnx.save(onnx_model, onnx_name)
-    logger.info("generated onnx model named {}".format(onnx_name))
+    logger.info("generated simplified onnx model named {}".format(onnx_name))
 
     # 5. export trt
     if args.trt:
