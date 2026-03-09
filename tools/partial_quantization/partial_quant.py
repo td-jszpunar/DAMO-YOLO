@@ -253,6 +253,17 @@ def make_parser():
         help="explicit quantizable op indices to quantize; overrides --model_type presets",
     )
     parser.add_argument(
+        "--quantize_all",
+        action="store_true",
+        help="quantize all Conv/ConvTranspose/MaxPool candidate ops; overrides --model_type presets",
+    )
+    parser.add_argument(
+        "--skip_layers",
+        type=str,
+        default=None,
+        help="comma-separated substrings of quantizable op names to keep in floating point",
+    )
+    parser.add_argument(
         "--list_quant_ops",
         action="store_true",
         help="print quantizable op indices/names and exit",
@@ -268,6 +279,11 @@ def make_parser():
         "--dynamic_batch",
         action="store_true",
         help="export dynamic batch axis for ONNX input/outputs",
+    )
+    parser.add_argument(
+        "--no_simplify",
+        action="store_true",
+        help="skip onnxsim.simplify after raw ONNX export",
     )
     parser.add_argument("--trt_eval", action="store_true", help="trt evaluation")
     parser.add_argument(
@@ -348,6 +364,17 @@ def main():
         raise ValueError("--calib_safety_ratio must be in (0, 1].")
     if args.calib_batches <= 0:
         raise ValueError("--calib_batches must be > 0.")
+    if args.quantize_all and args.model_type is not None:
+        logger.warning(
+            "--quantize_all overrides --model_type='{}'. Ignoring model_type.".format(
+                args.model_type
+            )
+        )
+
+    skip_patterns = []
+    if args.skip_layers:
+        skip_patterns = [p.strip() for p in args.skip_layers.split(",") if p.strip()]
+        logger.info("Skipping quantization for layer patterns: {}".format(skip_patterns))
 
     onnx_suffix = "_no_quant.onnx" if args.no_quant else "_partial_quant.onnx"
     onnx_name = args.config_file.split("/")[-1].replace(".py", onnx_suffix)
@@ -504,7 +531,7 @@ def main():
             if (
                 isinstance(m, quant_nn.QuantConv2d)
                 or isinstance(m, quant_nn.QuantConvTranspose2d)
-                or isinstance(m, quant_nn.MaxPool2d)
+                or isinstance(m, quant_nn.QuantMaxPool2d)
             ):
                 all_ops.append((k))
 
@@ -536,6 +563,17 @@ def main():
                     ", ".join(str(idx) for idx in selected_inds)
                 )
             )
+        elif args.quantize_all:
+            ops_to_quant = list(all_ops)
+            if args.keep_head_fp:
+                logger.warning(
+                    "Keeping detection head in FP; excluding head ops from full quantization."
+                )
+                ops_to_quant = [
+                    op_name
+                    for op_name in ops_to_quant
+                    if not (op_name == "head" or op_name.startswith("head."))
+                ]
         else:
             quant_model = args.model_type
             if quant_model == "tiny":
@@ -569,7 +607,7 @@ def main():
                 head_inds = list(range(108, 114))
             else:
                 raise ValueError(
-                    "Provide either --no_quant, --quant_op_indices, or a supported --model_type (tiny, small, medium)."
+                    "Provide either --no_quant, --quantize_all, --quant_op_indices, or a supported --model_type (tiny, small, medium)."
                 )
 
             all_inds = backbone_inds + neck_inds + head_inds
@@ -580,6 +618,19 @@ def main():
                 all_inds = backbone_inds + neck_inds
 
             ops_to_quant = [all_ops[x] for x in all_inds]
+
+        if skip_patterns:
+            before_count = len(ops_to_quant)
+            ops_to_quant = [
+                op_name
+                for op_name in ops_to_quant
+                if not any(pattern in op_name for pattern in skip_patterns)
+            ]
+            logger.info(
+                "Applied --skip_layers filter: kept {} / {} selected ops.".format(
+                    len(ops_to_quant), before_count
+                )
+            )
         logger.info(
             "Partial quantization will quantize {} / {} candidate ops.".format(
                 len(ops_to_quant), len(all_ops)
@@ -642,15 +693,18 @@ def main():
     logger.info("generated raw onnx model named {}".format(raw_onnx_name))
 
     onnx_model = onnx.load(raw_onnx_name)  # Fix output shape
-    try:
-        import onnxsim
+    if args.no_simplify:
+        logger.info("Skipping ONNX simplification because --no_simplify was set.")
+    else:
+        try:
+            import onnxsim
 
-        logger.info("Starting to simplify ONNX...")
-        # check_n=0 avoids onnxruntime dependency in minimal environments.
-        onnx_model, check = onnxsim.simplify(onnx_model, check_n=0)
-        assert check, "check failed"
-    except Exception as e:
-        logger.info(f"simplify skipped: {e}")
+            logger.info("Starting to simplify ONNX...")
+            # check_n=0 avoids onnxruntime dependency in minimal environments.
+            onnx_model, check = onnxsim.simplify(onnx_model, check_n=0)
+            assert check, "check failed"
+        except Exception as e:
+            logger.info(f"simplify skipped: {e}")
     onnx.save(onnx_model, onnx_name)
     logger.info("generated simplified onnx model named {}".format(onnx_name))
 
