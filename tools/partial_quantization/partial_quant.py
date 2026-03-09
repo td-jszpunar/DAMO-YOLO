@@ -35,6 +35,29 @@ def mkdir(path):
         os.makedirs(path)
 
 
+def resolve_export_paths(args):
+    onnx_suffix = "_no_quant" if args.no_quant else "_partial_quant"
+    default_stem = os.path.splitext(os.path.basename(args.config_file))[0] + onnx_suffix
+    output_dir = os.path.abspath(args.output_dir) if args.output_dir else os.getcwd()
+    output_name = args.output_name or default_stem
+
+    for ext in (".onnx", ".trt", ".engine"):
+        if output_name.endswith(ext):
+            output_name = output_name[: -len(ext)]
+            break
+
+    mkdir(output_dir)
+    onnx_name = os.path.join(output_dir, f"{output_name}.onnx")
+    raw_onnx_name = os.path.join(output_dir, f"{output_name}_raw.onnx")
+    trt_name = os.path.join(output_dir, f"{output_name}_bs{args.batch_size}.trt")
+    if args.output_dir or args.output_name:
+        calib_name = os.path.join(output_dir, f"{output_name}_calib.pth")
+    else:
+        ckpt_root, _ = os.path.splitext(args.ckpt)
+        calib_name = f"{ckpt_root}_calib.pth"
+    return raw_onnx_name, onnx_name, trt_name, calib_name
+
+
 def parse_inference_size(args):
     """Parse inference size from CLI.
 
@@ -182,6 +205,18 @@ def make_parser():
         help="bboxes output node name of onnx model",
     )
     parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="directory to write exported ONNX/TRT files; defaults to the current working directory",
+    )
+    parser.add_argument(
+        "--output_name",
+        type=str,
+        default=None,
+        help="base filename for exported ONNX/TRT files without extension",
+    )
+    parser.add_argument(
         "-o", "--opset", default=11, type=int, help="onnx opset version"
     )
     parser.add_argument("--calib_weights", type=str, default=None, help="calib weights")
@@ -306,11 +341,12 @@ def make_parser():
 
 
 @logger.catch
-def trt_export(onnx_path, batch_size, inference_h, inference_w):
+def trt_export(onnx_path, batch_size, inference_h, inference_w, engine_path=None):
     import tensorrt as trt
 
     TRT_LOGGER = trt.Logger()
-    engine_path = onnx_path.replace(".onnx", f"_bs{batch_size}.trt")
+    if engine_path is None:
+        engine_path = onnx_path.replace(".onnx", f"_bs{batch_size}.trt")
 
     EXPLICIT_BATCH = 1 << (int)(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
 
@@ -376,9 +412,6 @@ def main():
         skip_patterns = [p.strip() for p in args.skip_layers.split(",") if p.strip()]
         logger.info("Skipping quantization for layer patterns: {}".format(skip_patterns))
 
-    onnx_suffix = "_no_quant.onnx" if args.no_quant else "_partial_quant.onnx"
-    onnx_name = args.config_file.split("/")[-1].replace(".py", onnx_suffix)
-    raw_onnx_name = onnx_name.replace(".onnx", "_raw.onnx")
     # Check device
     cuda = args.device != "cpu" and torch.cuda.is_available()
     device = torch.device(f"cuda:{args.device}" if cuda else "cpu")
@@ -390,6 +423,13 @@ def main():
         config.test.batch_size = args.batch_size
     else:
         args.batch_size = config.test.batch_size
+
+    raw_onnx_name, onnx_name, trt_name, calib_name = resolve_export_paths(args)
+    logger.info(
+        "Export outputs: raw_onnx='{}', onnx='{}', trt='{}', calib='{}'".format(
+            raw_onnx_name, onnx_name, trt_name, calib_name
+        )
+    )
 
     # Ensure calibration dataloader uses a fixed export resolution (supports rectangular inputs).
     config.test.augment.transform.target_size = (inference_h, inference_w)
@@ -516,7 +556,7 @@ def main():
                 )
                 torch.save(
                     {"model_state_dict": ptq_model.state_dict()},
-                    args.ckpt.replace(".pth", "_calib.pth"),
+                    calib_name,
                 )
             finally:
                 destroy_calib_data_loader()
@@ -710,7 +750,13 @@ def main():
 
     # 5. export trt
     if args.trt:
-        trt_name = trt_export(onnx_name, args.batch_size, inference_h, inference_w)
+        trt_name = trt_export(
+            onnx_name,
+            args.batch_size,
+            inference_h,
+            inference_w,
+            engine_path=trt_name,
+        )
         # 6. trt eval
         if args.trt_eval:
             if inference_h != inference_w:
