@@ -2,7 +2,7 @@
 
 import copy
 
-from .giraffe_fpn_btn import GiraffeNeckV2
+from .giraffe_fpn_btn import GiraffeNeckV2, GiraffeNeckV3
 
 
 def build_neck(cfg):
@@ -10,5 +10,7 @@ def build_neck(cfg):
     name = neck_cfg.pop('name')
     if name == 'GiraffeNeckV2':
         return GiraffeNeckV2(**neck_cfg)
+    if name == 'GiraffeNeckV3':
+        return GiraffeNeckV3(**neck_cfg)
     else:
         raise NotImplementedError

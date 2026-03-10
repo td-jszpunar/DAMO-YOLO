@@ -11,8 +11,34 @@ from pytorch_quantization.tensor_quant import QuantDescriptor
 from damo.dataset import build_dataloader, build_dataset
 
 
+def torch_load_compat(path, map_location="cpu"):
+    """Load checkpoints across PyTorch versions (2.6 defaults weights_only=True)."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def extract_state_dict(ckpt):
+    """Normalize common checkpoint layouts to a raw state_dict."""
+    if isinstance(ckpt, dict):
+        if "model_state_dict" in ckpt:
+            return ckpt["model_state_dict"]
+        if "state_dict" in ckpt:
+            return ckpt["state_dict"]
+        if "model" in ckpt:
+            model_obj = ckpt["model"]
+            return (
+                model_obj.state_dict()
+                if hasattr(model_obj, "state_dict")
+                else model_obj
+            )
+        return ckpt
+    return ckpt.state_dict()
+
+
 def set_module(model, submodule_key, module):
-    tokens = submodule_key.split('.')
+    tokens = submodule_key.split(".")
     sub_tokens = tokens[:-1]
     cur_mod = model
     for s in sub_tokens:
@@ -21,7 +47,7 @@ def set_module(model, submodule_key, module):
 
 
 def get_module(model, submodule_key):
-    sub_tokens = submodule_key.split('.')
+    sub_tokens = submodule_key.split(".")
     cur_mod = model
     for s in sub_tokens:
         cur_mod = getattr(cur_mod, s)
@@ -30,16 +56,16 @@ def get_module(model, submodule_key):
 
 def module_quant_disable(ptq_model, k):
     verified_module = get_module(ptq_model, k)
-    if hasattr(verified_module, '_input_quantizer'):
+    if hasattr(verified_module, "_input_quantizer"):
         verified_module._input_quantizer.disable()
-    if hasattr(verified_module, '_weight_quantizer'):
+    if hasattr(verified_module, "_weight_quantizer"):
         verified_module._weight_quantizer.disable()
 
 
-def collect_stats(model, data_loader, batch_number, device='cuda'):
+def collect_stats(model, data_loader, batch_number, device="cuda"):
     """
-      code mainly from https://github.com/NVIDIA/TensorRT/blob/99a11a5fcdd1f184739bb20a8c4a473262c8ecc8/tools/pytorch-quantization/examples/torchvision/classification_flow.py
-      Feed data to the network and collect statistic
+    code mainly from https://github.com/NVIDIA/TensorRT/blob/99a11a5fcdd1f184739bb20a8c4a473262c8ecc8/tools/pytorch-quantization/examples/torchvision/classification_flow.py
+    Feed data to the network and collect statistic
     """
 
     # Enable calibrators
@@ -54,7 +80,7 @@ def collect_stats(model, data_loader, batch_number, device='cuda'):
     for i, data_tuple in enumerate(data_loader):
         images, targets, image_ids = data_tuple
         images = images.to(device)
-        output = model(images)
+        _ = model(images)
         if i + 1 >= batch_number:
             break
 
@@ -68,19 +94,54 @@ def collect_stats(model, data_loader, batch_number, device='cuda'):
                 module.enable()
 
 
-def compute_amax(model, **kwargs):
+def _load_module_calib_amax(module, method="entropy", percentile=99.99):
+    if isinstance(module._calibrator, calib.MaxCalibrator):
+        module.load_calib_amax()
+        return
+
+    if method == "entropy":
+        module.load_calib_amax(method="entropy")
+    elif method == "percentile":
+        module.load_calib_amax(method="percentile", percentile=percentile)
+    elif method == "max":
+        # Histogram calibrator has no direct "max" method, so use full percentile.
+        module.load_calib_amax(method="percentile", percentile=100.0)
+    else:
+        raise ValueError(f"Unknown calibration method: {method}")
+
+
+def compute_amax(
+    model, method="entropy", fallback_method="percentile", percentile=99.99
+):
     """
-      code mainly from https://github.com/NVIDIA/TensorRT/blob/99a11a5fcdd1f184739bb20a8c4a473262c8ecc8/tools/pytorch-quantization/examples/torchvision/classification_flow.py
-      Load calib result
+    code mainly from https://github.com/NVIDIA/TensorRT/blob/99a11a5fcdd1f184739bb20a8c4a473262c8ecc8/tools/pytorch-quantization/examples/torchvision/classification_flow.py
+    Load calib result
     """
     for name, module in model.named_modules():
         if isinstance(module, quant_nn.TensorQuantizer):
-            print(F"{name:40}: {module}")
+            print(f"{name:40}: {module}")
             if module._calibrator is not None:
-                if isinstance(module._calibrator, calib.MaxCalibrator):
-                    module.load_calib_amax()
-                else:
-                    module.load_calib_amax(**kwargs)
+                try:
+                    _load_module_calib_amax(
+                        module, method=method, percentile=percentile
+                    )
+                except (OverflowError, RuntimeError) as primary_exc:
+                    can_fallback = (
+                        fallback_method is not None
+                        and fallback_method != "none"
+                        and fallback_method != method
+                    )
+                    if not can_fallback:
+                        raise
+                    print(
+                        "Primary calibration failed on {} with method '{}': {}. "
+                        "Retrying with fallback '{}'.".format(
+                            name, method, primary_exc, fallback_method
+                        )
+                    )
+                    _load_module_calib_amax(
+                        module, method=fallback_method, percentile=percentile
+                    )
 
 
 def quantable_op_check(k, ops_to_quant):
@@ -93,30 +154,36 @@ def quantable_op_check(k, ops_to_quant):
         return False
 
 
-def quant_model_init(ori_model, device):
-
+def quant_model_init(ori_model, device, calib_method="entropy"):
     ptq_model = copy.deepcopy(ori_model)
     ptq_model.eval()
     ptq_model.to(device)
+    calib_desc_method = "max" if calib_method == "max" else "histogram"
     quant_conv_desc_weight = tensor_quant.QUANT_DESC_8BIT_CONV2D_WEIGHT_PER_CHANNEL
-    quant_conv_desc_input = QuantDescriptor(num_bits=8, calib_method='histogram')
+    quant_conv_desc_input = QuantDescriptor(num_bits=8, calib_method=calib_desc_method)
 
-    quant_convtrans_desc_weight = tensor_quant.QUANT_DESC_8BIT_CONVTRANSPOSE2D_WEIGHT_PER_CHANNEL
-    quant_convtrans_desc_input = QuantDescriptor(num_bits=8, calib_method='histogram')
+    quant_convtrans_desc_weight = (
+        tensor_quant.QUANT_DESC_8BIT_CONVTRANSPOSE2D_WEIGHT_PER_CHANNEL
+    )
+    quant_convtrans_desc_input = QuantDescriptor(
+        num_bits=8, calib_method=calib_desc_method
+    )
 
     for k, m in ptq_model.named_modules():
-        if 'proj_conv' in k:
+        if "proj_conv" in k:
             print("Layer {} won't be quantized".format(k))
             continue
 
         if isinstance(m, nn.Conv2d):
-            quant_conv = quant_nn.QuantConv2d(m.in_channels,
-                                              m.out_channels,
-                                              m.kernel_size,
-                                              m.stride,
-                                              m.padding,
-                                              quant_desc_input = quant_conv_desc_input,
-                                              quant_desc_weight = quant_conv_desc_weight)
+            quant_conv = quant_nn.QuantConv2d(
+                m.in_channels,
+                m.out_channels,
+                m.kernel_size,
+                m.stride,
+                m.padding,
+                quant_desc_input=quant_conv_desc_input,
+                quant_desc_weight=quant_conv_desc_weight,
+            )
             quant_conv.weight.data.copy_(m.weight.detach())
             if m.bias is not None:
                 quant_conv.bias.data.copy_(m.bias.detach())
@@ -124,13 +191,15 @@ def quant_model_init(ori_model, device):
                 quant_conv.bias = None
             set_module(ptq_model, k, quant_conv)
         elif isinstance(m, nn.ConvTranspose2d):
-            quant_convtrans = quant_nn.QuantConvTranspose2d(m.in_channels,
-                                                       m.out_channels,
-                                                       m.kernel_size,
-                                                       m.stride,
-                                                       m.padding,
-                                                       quant_desc_input = quant_convtrans_desc_input,
-                                                       quant_desc_weight = quant_convtrans_desc_weight)
+            quant_convtrans = quant_nn.QuantConvTranspose2d(
+                m.in_channels,
+                m.out_channels,
+                m.kernel_size,
+                m.stride,
+                m.padding,
+                quant_desc_input=quant_convtrans_desc_input,
+                quant_desc_weight=quant_convtrans_desc_weight,
+            )
             quant_convtrans.weight.data.copy_(m.weight.detach())
             if m.bias is not None:
                 quant_convtrans.bias.data.copy_(m.bias.detach())
@@ -138,17 +207,14 @@ def quant_model_init(ori_model, device):
                 quant_convtrans.bias = None
             set_module(ptq_model, k, quant_convtrans)
         elif isinstance(m, nn.MaxPool2d):
-            kernel_size = m.kernel_size
-            stride = m.stride
-            padding = m.padding
-            dilation = m.dilation
-            ceil_mode = m.ceil_mode
-            quant_maxpool2d = quant_nn.QuantMaxPool2d(m.kernel_size,
-                                                      m.stride,
-                                                      m.padding,
-                                                      m.dilation,
-                                                      m.ceil_mode,
-                                                      quant_desc_input = quant_conv_desc_input)
+            quant_maxpool2d = quant_nn.QuantMaxPool2d(
+                m.kernel_size,
+                m.stride,
+                m.padding,
+                m.dilation,
+                m.ceil_mode,
+                quant_desc_input=quant_conv_desc_input,
+            )
             set_module(ptq_model, k, quant_maxpool2d)
         else:
             continue
@@ -156,17 +222,32 @@ def quant_model_init(ori_model, device):
     return ptq_model.to(device)
 
 
-def post_train_quant(ori_model, calib_data_loader, calib_img_number, device):
-    ptq_model = quant_model_init(ori_model, device)
+def post_train_quant(
+    ori_model,
+    calib_data_loader,
+    calib_img_number,
+    device,
+    calib_method="entropy",
+    fallback_method="percentile",
+    percentile=99.99,
+):
+    ptq_model = quant_model_init(ori_model, device, calib_method=calib_method)
     with torch.no_grad():
         collect_stats(ptq_model, calib_data_loader, calib_img_number, device)
-        compute_amax(ptq_model, method='entropy')
+        compute_amax(
+            ptq_model,
+            method=calib_method,
+            fallback_method=fallback_method,
+            percentile=percentile,
+        )
     return ptq_model
 
 
-def load_quanted_model(model, calib_weights_path, device):
-    ptq_model = quant_model_init(model, device)
-    ptq_model.load_state_dict(torch.load(calib_weights_path)['model'].state_dict())
+def load_quanted_model(model, calib_weights_path, device, calib_method="entropy"):
+    ptq_model = quant_model_init(model, device, calib_method=calib_method)
+    ckpt = torch_load_compat(calib_weights_path, map_location="cpu")
+    state_dict = extract_state_dict(ckpt)
+    ptq_model.load_state_dict(state_dict)
     return ptq_model
 
 
@@ -175,30 +256,41 @@ def execute_partial_quant(ptq_model, ops_to_quant=None):
         if quantable_op_check(k, ops_to_quant):
             continue
         # enable full-precision
-        if isinstance(m, quant_nn.QuantConv2d) or \
-            isinstance(m, quant_nn.QuantConvTranspose2d) or \
-            isinstance(m, quant_nn.QuantMaxPool2d):
+        if (
+            isinstance(m, quant_nn.QuantConv2d)
+            or isinstance(m, quant_nn.QuantConvTranspose2d)
+            or isinstance(m, quant_nn.QuantMaxPool2d)
+        ):
             module_quant_disable(ptq_model, k)
 
 
 def init_calib_data_loader(config):
     # init dataloader
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '5678'
-    os.environ['WORLD_SIZE'] = '1'
-    torch.distributed.init_process_group(backend='nccl',
-                                         init_method='env://',
-                                         rank=0)
+    if torch.distributed.is_available() and not torch.distributed.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if backend == "gloo":
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+        init_file = os.path.join("/tmp", f"damoyolo_ptq_dist_{os.getpid()}")
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method=f"file://{init_file}",
+            rank=0,
+            world_size=1,
+        )
 
     val_dataset = build_dataset(config, config.dataset.val_ann, is_train=False)
-    val_loader = build_dataloader(val_dataset,
-                                  config.test.augment,
-                                  batch_size=config.test.batch_size,
-                                  num_workers=config.miscs.num_workers,
-                                  is_train=False,
-                                  size_div=32)
+    val_loader = build_dataloader(
+        val_dataset,
+        config.test.augment,
+        batch_size=config.test.batch_size,
+        num_workers=config.miscs.num_workers,
+        is_train=False,
+        size_div=32,
+    )
 
     return val_loader[0]
 
 
-
+def destroy_calib_data_loader():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
